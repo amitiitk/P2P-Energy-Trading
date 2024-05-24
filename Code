@@ -1,105 +1,120 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.6.0;
+pragma solidity ^0.8.0;
 
-contract EnergyTradingWithDSO {
-    struct Stakeholder {
-        uint role;
-        bool isRegistered;
+contract EnergyTradingSystem {
+    enum State { Register, Injected, Board, Match, Purchased }
+
+    struct EnergyOwnership {
+        address account;
+        uint256 amount;
+        State state;
+        uint256 timestamp;
     }
 
-    struct Transaction {
-        address seller;
-        address buyer;
-        uint amount;
-        uint initialPrice;
-        uint negotiatedPrice;
-        bool priceConfirmed;
-        uint createTime;     // Timestamp when the transaction was created
-        uint confirmTime;    // Timestamp when the transaction was confirmed by the buyer
-        uint settleTime;     // Timestamp when the transaction was settled by the DSO
-        uint energySent;     // Energy sent by the prosumer
-        uint energyReceived; // Energy actually received by the consumer
-        uint lossPercent;    // Percentage of energy lost during transmission
-    }
-
-    struct EnergyOffer {
-        address prosumer;
-        uint amount;
-        uint price;
-        bool isActive;
-    }
-
-    mapping(address => Stakeholder) public stakeholders;
-    mapping(uint => Transaction) public transactions;
-    mapping(uint => EnergyOffer) public offers;
-    uint public transactionCount;
-    uint public offerCount;
     address public dso;
+    uint256 public immutable energyLossThreshold;
+    mapping(address => EnergyOwnership) public ownerships;
+    mapping(address => uint256) public balances;
 
-    event TransactionUpdated(uint transactionId, string updateType);
+    event OwnershipEvent(address indexed account, uint256 amount, State state, uint256 timestamp);
+    event EnergyInjected(address indexed account, uint256 amount, uint256 timestamp);
+    event EnergyMatched(address indexed account, uint256 amount, State state, uint256 timestamp);
+    event EnergyTraded(address indexed account, uint256 amount, State state, uint256 timestamp);
+    event MitigationActionsTaken(uint256 lossPercentage);
+    event NoMitigationNeeded(uint256 lossPercentage);
 
-    modifier onlyDSO() {
-        require(msg.sender == dso, "Only DSO can perform this action");
-        _;
+    constructor(uint256 _threshold) {
+        require(_threshold > 0, "Threshold must be greater than zero");
+        energyLossThreshold = _threshold;
     }
 
-    constructor() public  {
-        dso = msg.sender; // The deployer is the DSO
-    }
+    function registerNode(address account, bool isDSO, bool isProsumer) public {
+        require(account != address(0), "Invalid address");
 
-    function registerStakeholder(address addr, uint role) public onlyDSO {
-        require(!stakeholders[addr].isRegistered, "Already registered");
-        stakeholders[addr] = Stakeholder(role, true);
-    }
-
-    function createOffer(uint amount, uint price) public {
-        require(stakeholders[msg.sender].role == 1 && stakeholders[msg.sender].isRegistered, "Unauthorized or not registered");
-        offers[offerCount++] = EnergyOffer(msg.sender, amount, price, true);
-    }
-
-    function acceptOffer(uint offerId) public {
-        require(stakeholders[msg.sender].role == 2 && stakeholders[msg.sender].isRegistered, "Unauthorized or not registered");
-        require(offers[offerId].isActive, "Offer not active");
-        transactions[transactionCount++] = Transaction(offers[offerId].prosumer, msg.sender, offers[offerId].amount, offers[offerId].price, offers[offerId].price, false, block.timestamp, 0, 0, offers[offerId].amount, 0, 0);
-        offers[offerId].isActive = false;
-        emit TransactionUpdated(transactionCount - 1, "Created");
-    }
-
-    function proposePrice(uint transactionId, uint price) public {
-        Transaction storage txn = transactions[transactionId];
-        require((msg.sender == txn.seller || msg.sender == txn.buyer) && !txn.priceConfirmed, "Unauthorized or price already confirmed");
-        txn.negotiatedPrice = price;
-        emit TransactionUpdated(transactionId, "Price Proposed");
-    }
-
-    function confirmPrice(uint transactionId) public {
-        Transaction storage txn = transactions[transactionId];
-        require((msg.sender == txn.seller || msg.sender == txn.buyer) && txn.negotiatedPrice != 0, "Unauthorized or no price proposed");
-        txn.priceConfirmed = true;
-        emit TransactionUpdated(transactionId, "Price Confirmed");
-    }
-
-    function confirmDelivery(uint transactionId, uint energyReceived) public {
-        Transaction storage txn = transactions[transactionId];
-        require(msg.sender == txn.buyer && txn.priceConfirmed, "Unauthorized or price not confirmed");
-        txn.energyReceived = energyReceived;
-        txn.lossPercent = calculateLoss(txn.energySent, energyReceived);
-        txn.confirmTime = block.timestamp;
-        emit TransactionUpdated(transactionId, "Delivery Confirmed");
-    }
-
-    function calculateLoss(uint energySent, uint energyReceived) private pure returns (uint) {
-        if (energyReceived >= energySent) return 0;
-        return 100 - (energyReceived * 100 / energySent);
-    }
-
-    function settleTransaction(uint transactionId) public onlyDSO {
-        Transaction storage txn = transactions[transactionId];
-        require(txn.confirmTime != 0, "Delivery not confirmed");
-        txn.settleTime = block.timestamp;
-        if (txn.lossPercent > 0) {
-            txn.negotiatedPrice -= txn.negotiatedPrice * txn.lossPercent / 100;
+        if (isDSO) {
+            dso = account;
+        } else {
+            ownerships[account] = EnergyOwnership({
+                account: account,
+                amount: 0,
+                state: State.Register,
+                timestamp: block.timestamp
+            });
+            emit OwnershipEvent(account, 0, State.Register, block.timestamp);
         }
-        emit TransactionUpdated(transactionId, "Transaction Settled");
+    }
+
+    function injectEnergy(address prosumer, uint256 energyAmount) public {
+        require(prosumer != address(0), "Invalid address");
+        require(msg.sender == prosumer, "Only the prosumer can inject energy");
+
+        EnergyOwnership storage ownership = ownerships[prosumer];
+        ownership.amount += energyAmount;
+        ownership.state = State.Injected;
+        ownership.timestamp = block.timestamp;
+
+        emit EnergyInjected(prosumer, energyAmount, block.timestamp);
+    }
+
+    function matchEnergy(address[] memory prosumers, address[] memory consumers) public {
+        for (uint256 i = 0; i < prosumers.length; i++) {
+            EnergyOwnership storage ownership = ownerships[prosumers[i]];
+            if (ownership.state == State.Injected && ownership.amount > 0) {
+                ownership.state = State.Board;
+                emit EnergyMatched(prosumers[i], ownership.amount, State.Board, block.timestamp);
+                require(ownership.state != State.Register, "Invalid state transition"); // Additional check
+            }
+        }
+
+        for (uint256 j = 0; j < consumers.length; j++) {
+            EnergyOwnership storage ownership = ownerships[consumers[j]];
+            ownership.state = State.Match;
+            emit EnergyMatched(consumers[j], ownership.amount, State.Match, block.timestamp);
+            require(ownership.state != State.Register, "Invalid state transition"); // Additional check
+        }
+    }
+
+    function tradeEnergy(address[] memory prosumers, address[] memory consumers, uint256 price) public {
+        for (uint256 i = 0; i < prosumers.length; i++) {
+            EnergyOwnership storage ownership = ownerships[prosumers[i]];
+            uint256 energySold = ownership.amount;
+            balances[prosumers[i]] += energySold * price;
+            ownership.state = State.Purchased;
+            ownership.amount = 0; // Reset the energy amount after trading
+            emit EnergyTraded(prosumers[i], energySold, State.Purchased, block.timestamp);
+        }
+
+        for (uint256 j = 0; j < consumers.length; j++) {
+            EnergyOwnership storage ownership = ownerships[consumers[j]];
+            ownership.state = State.Purchased;
+            emit EnergyTraded(consumers[j], ownership.amount, State.Purchased, block.timestamp);
+        }
+    }
+
+    function verify(address account, string memory action) public view {
+        require(account != address(0), "Invalid address");
+
+        if (keccak256(abi.encodePacked(action)) == keccak256("Trade")) {
+            require(ownerships[account].state == State.Purchased, "Trade not verified");
+            require(ownerships[account].state != State.Register && ownerships[account].state != State.Board, "Invalid state transition"); // Additional check
+        } else if (keccak256(abi.encodePacked(action)) == keccak256("Injection")) {
+            require(ownerships[account].state == State.Injected, "Injection not verified");
+            require(ownerships[account].state != State.Register && ownerships[account].state != State.Board, "Invalid state transition"); // Additional check
+        } else {
+            revert("Invalid action");
+        }
+    }
+
+    function calculateAndMitigateEnergyLoss(uint256 sourceEnergy, uint256 destinationEnergy) public returns (uint256) {
+        uint256 energyLoss = sourceEnergy - destinationEnergy;
+        uint256 energyLossPercentage = (energyLoss * 100) / sourceEnergy;
+
+        if (energyLossPercentage > energyLossThreshold) {
+            emit MitigationActionsTaken(energyLossPercentage);
+        } else {
+            emit NoMitigationNeeded(energyLossPercentage);
+        }
+
+        return energyLossPercentage;
     }
 }
